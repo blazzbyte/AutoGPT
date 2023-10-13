@@ -15,6 +15,8 @@ from forge.sdk import (
 import json	
 import pprint
 
+from typing import Optional
+
 LOG = ForgeLogger(__name__)
 
 MODEL_NAME = "gpt-3.5-turbo"  #gpt-4
@@ -30,24 +32,35 @@ class ForgeAgent(Agent):
         LOG.info(
             f"📦 Task created: {task.task_id} input: {task.input[:40]}{'...' if len(task.input) > 40 else ''}"
         )
+        print(task)
+        await self.generate_steps(task)
         return task
 
-    async def plan_steps(self, task, step_request: StepRequestBody):
-        step_request.name = "Plan steps"
+    async def execute_step(self, task_id: str, step_request: StepRequestBody) -> Step:
+        task = await self.db.get_task(task_id)
+        ##Se recupera los pasos creados en el generate_steps
+        steps, page = await self.db.list_steps(task_id, per_page=100)
+        print(steps)
+        step = steps[-1]
+        print(step)
 
-        if not step_request.input:
-            step_request.input = "Create steps to accomplish the objective"
-
-        step = await self.db.create_step(
-            task_id=task.task_id, input=step_request, is_last=False
+        output = await self.abilities.run_ability(
+            task_id, "read_file", file_path='file_to_read.txt'
         )
+        print(output)
+        return step
 
-        files = self.workspace.list(task.task_id, "/")
+    async def generate_steps(self, task: Task) -> None:
 
         prompt_engine = PromptEngine("plan-steps")
+
+        ##files = self.workspace.list(task.task_id, "/")
+        abilities = self.abilities.list_abilities_for_prompt()
+
+        ##System Prompt
         task_kwargs = {
-            "abilities": self.abilities.list_abilities_for_prompt(),
-            "files": files
+            "abilities": abilities,
+            ##"files": files
         }
         system_prompt = prompt_engine.load_prompt("system-prompt",  **task_kwargs)
         system_format = prompt_engine.load_prompt("step-format")
@@ -59,83 +72,59 @@ class ForgeAgent(Agent):
         task_kwargs = {
             "task": task.input,
         }
+
         task_prompt = prompt_engine.load_prompt("user-prompt",  **task_kwargs)
+
         messages.append({"role": "user", "content": task_prompt})
 
-        answer = await self.do_steps_request(messages, new_plan=True)
+        ## Call to Completation Open AI
+        chat_completation_kwargs = {
+            "messages": messages,
+            "model": MODEL_NAME,
+        }
 
-        await self.create_steps(task.task_id, answer["steps"])
-        await self.db.update_step(task.task_id, step.step_id, "completed", output=answer["thoughts"]["text"])
+        try:
+          chat_response = await chat_completion_request(**chat_completation_kwargs)
+          print(chat_response)
+          response = chat_response["choices"][0]["message"]["content"]
+          stepsJSON = json.loads(response)
+          for i, step_data in enumerate(stepsJSON["steps"], start=1):
+            # Formatear el paso para que se ajuste a StepRequestBody
+            step_request = StepRequestBody(
+                name=step_data["name"],
+                input=step_data["input"],
+                additional_input=step_data["additional_input"],
+            )
 
-        return step
+            # Marcar el último paso como is_last
+            is_last = i == len(stepsJSON["steps"])
 
-    async def execute_step(self, task_id: str, step_request: StepRequestBody) -> Step:
+            # Crear el paso en la base de datos
+            await self.db.create_step(task_id= task.task_id, input=step_request, additional_input = step_request.additional_input, is_last=is_last)
+
+            LOG.info(f"Create step {i}: {step_data['name']}")
+        except Exception as e:
+          print('An exception occurred', e)
+    
+    async def get_current_step(self, task_id: str) -> Optional[Step]:
         """
-        For a tutorial on how to add your own logic please see the offical tutorial series:
-        https://aiedge.medium.com/autogpt-forge-e3de53cc58ec
-
-        The agent protocol, which is the core of the Forge, works by creating a task and then
-        executing steps for that task. This method is called when the agent is asked to execute
-        a step.
-
-        The task that is created contains an input string, for the benchmarks this is the task
-        the agent has been asked to solve and additional input, which is a dictionary and
-        could contain anything.
-
-        If you want to get the task use:
-
-        ```
-        task = await self.db.get_task(task_id)
-        ```
-
-        The step request body is essentially the same as the task request and contains an input
-        string, for the benchmarks this is the task the agent has been asked to solve and
-        additional input, which is a dictionary and could contain anything.
-
-        You need to implement logic that will take in this step input and output the completed step
-        as a step object. You can do everything in a single step or you can break it down into
-        multiple steps. Returning a request to continue in the step output, the user can then decide
-        if they want the agent to continue or not.
+        Get the currernt step for executing.     
         """
+        page = 1  # Página inicial
+        per_page = 10  # Cantidad de elementos por página
 
-        task = await self.db.get_task(task_id)
+        while True:
+            # Obtener la página actual de pasos
+            steps, _ = await self.db.list_steps(task_id=task_id, page=page, per_page=per_page)
 
-        steps, page = await self.db.list_steps(task_id, per_page=100)
+            for step in steps:
+                if step.status == Status.created.value:
+                    return step
 
-        if not steps:
-            return await self.plan_steps(task, step_request)
-        
-        
-        previous_steps = []
-        next_steps = []
-        for step in steps:
-            if step.status == Status.created:
-                next_steps.append(step)
-            elif step.status == Status.completed:
-                previous_steps.append(step)
-        
-        if not next_steps:
-            LOG.info(f"Tried to execute with no next steps, return last step as the last")
-            step = previous_steps[-1]
-            step.is_last = True
-            return step
-        # An example that
-        step = await self.db.create_step(
-            task_id=task_id, input=step_request, is_last=True
-        )
+            # Si no se encontró un paso en la página actual, pasar a la siguiente página
+            if not steps or len(steps) < per_page:
+                break  # No hay más páginas
 
-        self.workspace.write(task_id=task_id, path="output.txt", data=b"Washington D.C")
+            page += 1
 
-        await self.db.create_artifact(
-            task_id=task_id,
-            step_id=step.step_id,
-            file_name="output.txt",
-            relative_path="",
-            agent_created=True,
-        )
-
-        step.output = "Washington D.C"
-
-        LOG.info(f"\t✅ Final Step completed: {step.step_id}")
-
-        return step
+        return None  # No se encontró ningún paso en estado "created"
